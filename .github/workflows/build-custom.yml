@@ -1,0 +1,113 @@
+name: Build Custom Bazarr Image
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4.1.1
+
+      - name: Get latest bazarr version
+        id: version
+        run: |
+          printf "# Custom build for docker-bazarr\n\n" >> $GITHUB_STEP_SUMMARY
+
+          EXT_RELEASE=$(curl -sX GET "https://api.github.com/repos/morpheus65535/bazarr/releases/latest" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            | jq -r '.tag_name')
+
+          if [ -z "${EXT_RELEASE}" ] || [ "${EXT_RELEASE}" == "null" ]; then
+            echo "> [!WARNING]" >> $GITHUB_STEP_SUMMARY
+            echo "> Can't retrieve external version, exiting" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+
+          EXT_RELEASE_SANITIZED=$(echo ${EXT_RELEASE} | sed 's/[~,%@+;:/]//g')
+          echo "Bazarr version: \`${EXT_RELEASE_SANITIZED}\`" >> $GITHUB_STEP_SUMMARY
+          echo "VERSION=${EXT_RELEASE_SANITIZED}" >> $GITHUB_OUTPUT
+
+      - name: Check if version already built
+        id: check
+        run: |
+          OWNER=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')
+          token=$(curl -sX GET \
+            "https://ghcr.io/token?scope=repository%3A${OWNER}%2Fbazarr%3Apull" \
+            | jq -r '.token')
+
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            --header "Authorization: Bearer ${token}" \
+            "https://ghcr.io/v2/${OWNER}/bazarr/manifests/${{ steps.version.outputs.VERSION }}-custom")
+
+          if [ "${STATUS}" == "200" ]; then
+            echo "Version ${{ steps.version.outputs.VERSION }}-custom already exists, skipping build." >> $GITHUB_STEP_SUMMARY
+            echo "SKIP=true" >> $GITHUB_OUTPUT
+          else
+            echo "New version detected, proceeding with build." >> $GITHUB_STEP_SUMMARY
+            echo "SKIP=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Apply patches to Dockerfile
+        if: steps.check.outputs.SKIP == 'false'
+        run: |
+          ENCODED=$(base64 -w 0 .github/patch.py)
+
+          echo '' >> Dockerfile
+          echo '# Custom patch: raise days_to_upgrade_subs limit from 30 to 300' >> Dockerfile
+          echo 'RUN echo "=== Patching config.py ===" && \' >> Dockerfile
+          echo "    grep -rl 'days_to_upgrade_subs' /app/bazarr/bin/bazarr/ \\" >> Dockerfile
+          echo "      | xargs sed -i -e 's/lte=30)/lte=300)/g' && \\" >> Dockerfile
+          echo '    echo "=== Patching compiled frontend JS ===" && \' >> Dockerfile
+          echo "    echo ${ENCODED} | base64 -d | python3 && \\" >> Dockerfile
+          echo '    echo "=== Patch complete. Verifying ===" && \' >> Dockerfile
+          echo "    grep -r 'lte=300' /app/bazarr/bin/bazarr/ && \\" >> Dockerfile
+          echo "    grep -rl 'settings-general-days_to_upgrade_subs' /app/bazarr/bin/frontend/ \\" >> Dockerfile
+          echo "      | xargs grep -c 'max:300' || true" >> Dockerfile
+          echo "Patch appended to Dockerfile" >> $GITHUB_STEP_SUMMARY
+
+      - name: Set up QEMU
+        if: steps.check.outputs.SKIP == 'false'
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        if: steps.check.outputs.SKIP == 'false'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: steps.check.outputs.SKIP == 'false'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Lowercase repository owner
+        if: steps.check.outputs.SKIP == 'false'
+        id: owner
+        run: echo "OWNER=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
+
+      - name: Build and push
+        if: steps.check.outputs.SKIP == 'false'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            BAZARR_VERSION=${{ steps.version.outputs.VERSION }}
+          tags: |
+            ghcr.io/${{ steps.owner.outputs.OWNER }}/bazarr:latest
+            ghcr.io/${{ steps.owner.outputs.OWNER }}/bazarr:${{ steps.version.outputs.VERSION }}-custom
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        if: steps.check.outputs.SKIP == 'false'
+        run: |
+          printf "\n## Build Complete\n\n" >> $GITHUB_STEP_SUMMARY
+          echo "Built and pushed \`ghcr.io/${{ steps.owner.outputs.OWNER }}/bazarr:${{ steps.version.outputs.VERSION }}-custom\`" >> $GITHUB_STEP_SUMMARY
